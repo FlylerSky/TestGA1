@@ -112,15 +112,4 @@ function connect() {
   });
 }
 
-connect();    setTimeout(connect, 5000);
-  });
-
-  ws.on("close", (code, reason) => {
-    if (code !== 1000) {
-      console.warn(`[server] Kết nối đóng (${code}): ${reason} — thử lại...`);
-      setTimeout(connect, 5000);
-    }
-  });
-}
-
 connect();
