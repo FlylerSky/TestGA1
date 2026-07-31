@@ -1,49 +1,104 @@
-name: SSH into Runneron:workflow_dispatch:inputs:timeout_minutes:description: "Thời gian tối đa giữ session (phút)"required: falsedefault: "60"jobs:ssh-session:name: "🔌 Open SSH Tunnel"runs-on: ubuntu-latesttimeout-minutes: ${{ fromJson(github.event.inputs.timeout_minutes || '60') }}steps:
-  - name: Setup Node.js
-    uses: actions/setup-node@v4
-    with:
-      node-version: "20"
+name: SSH into Runner
 
-  - name: Install dependencies
-    run: |
-      sudo apt-get update -qq
-      sudo apt-get install -y -qq build-essential python3
-      npm install ws node-pty
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_minutes:
+        description: "Timeout session (phút)"
+        required: false
+        default: "60"
 
-  - name: Create runner-server.js
-    run: |
-      cat << 'EOF' > runner-server.js
-      const WebSocket = require("ws");
-      const pty = require("node-pty");
-      const os = require("os");
-      
-      const ws = new WebSocket(process.env.RELAY_URL, { headers: { "x-secret": process.env.SSH_SECRET, "x-role": "server" } });
-      let shellProcess;
-      
-      ws.on("open", () => {
-        shellProcess = pty.spawn("bash", [], { name: "xterm-256color", cols: 80, rows: 24, cwd: process.env.GITHUB_WORKSPACE, env: process.env });
-        shellProcess.onData((data) => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: "data", payload: Buffer.from(data).toString("base64") })); });
-        shellProcess.onExit(() => process.exit(0));
-      });
-      
-      ws.on("message", (raw) => {
-        try {
-          const msg = JSON.parse(raw.toString());
-          if (msg.type === "data") shellProcess.write(Buffer.from(msg.payload, "base64").toString("utf-8"));
-          else if (msg.type === "resize") shellProcess.resize(msg.cols, msg.rows);
-        } catch (e) {}
-      });
-      
-      ws.on("close", () => { if(shellProcess) shellProcess.kill(); process.exit(0); });
-      EOF
+jobs:
+  ssh-session:
+    name: "🔌 Khởi chạy SSH Server"
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJson(github.event.inputs.timeout_minutes || '60') }}
 
-  - name: Start SSH tunnel server
-    env:
-      RELAY_URL  : ${{ secrets.RELAY_URL }}
-      SSH_SECRET : ${{ secrets.SSH_SECRET }}
-    run: |
-      echo "🚀 Đang khởi động SSH tunnel..."
-      echo "Chạy lệnh sau trên máy tính của bạn:"
-      echo "RELAY_URL=$RELAY_URL SSH_SECRET=*** node client.js"
-      node runner-server.js
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cài đặt thư viện WS và PTY
+        run: npm install ws node-pty
+
+      - name: Tạo file Server và Chạy
+        env:
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          SSH_SECRET: ${{ secrets.SSH_SECRET }}
+        run: |
+          cat << 'EOF' > runner-server.js
+          const os = require("os");
+          const pty = require("node-pty");
+          const WebSocket = require("ws");
+
+          const RELAY_URL = process.env.RELAY_URL;
+          const SECRET = process.env.SSH_SECRET;
+
+          if (!RELAY_URL || !SECRET) {
+            console.error("❌ Thiếu RELAY_URL hoặc SSH_SECRET");
+            process.exit(1);
+          }
+
+          console.log(`🔌 Đang kết nối tới Relay: ${RELAY_URL}`);
+          const ws = new WebSocket(RELAY_URL, {
+            headers: { "x-secret": SECRET, "x-role": "server" },
+          });
+
+          let shell;
+
+          ws.on("open", () => {
+            console.log("✅ Đã kết nối với Relay! Đang chờ Client...");
+          });
+
+          ws.on("message", (raw) => {
+            try {
+              const msg = JSON.parse(raw.toString());
+              
+              if (msg.type === "resize" && shell) {
+                shell.resize(msg.cols, msg.rows);
+              } 
+              else if (msg.type === "data" && shell) {
+                shell.write(Buffer.from(msg.payload, "base64").toString("utf-8"));
+              }
+              else if (msg.type === "ping") {
+                ws.send(JSON.stringify({ type: "pong" }));
+              }
+            } catch (e) {
+              if (!shell) {
+                shell = pty.spawn("bash", [], {
+                  name: "xterm-color",
+                  cols: 80,
+                  rows: 30,
+                  cwd: process.env.GITHUB_WORKSPACE || process.cwd(),
+                  env: process.env
+                });
+
+                shell.onData((data) => {
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                      type: "data",
+                      payload: Buffer.from(data).toString("base64")
+                    }));
+                  }
+                });
+                
+                shell.write(raw.toString());
+              } else {
+                shell.write(raw.toString());
+              }
+            }
+          });
+
+          ws.on("close", () => {
+            console.log("🔌 Đóng kết nối. Dừng server...");
+            if (shell) shell.kill();
+            process.exit(0);
+          });
+          EOF
+
+          node runner-server.js
