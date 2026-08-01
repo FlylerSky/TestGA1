@@ -1,0 +1,20 @@
+name: Debug with tmate (ARM)
+
+on: 
+  workflow_dispatch:
+
+jobs:
+  debug:
+    # Sử dụng máy ảo Ubuntu chạy trên kiến trúc ARM64
+    runs-on: ubuntu-24.04-arm 
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Thêm các bước setup khác nếu bạn muốn test môi trường
+      
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
