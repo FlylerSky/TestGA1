@@ -1,253 +1,201 @@
 /**
  * server.js - Chay tren Github Actions Runner
+ * 
+ * Ho tro:
+ *   - Interactive shell (PTY that qua pty_wrapper.py)
+ *   - Port forwarding: tunnel cac port tren runner ve may local
+ *
  * npm install ws
  */
-
 "use strict";
 
 const { execSync, spawn } = require("child_process");
+const net     = require("net");
+const path    = require("path");
 const WebSocket = require("ws");
 
-const RELAY_URL = process.env.RELAY_URL;
-const SECRET    = process.env.SSH_SECRET;
-const SHELL     = process.env.SHELL || "/bin/bash";
+const RELAY_URL   = process.env.RELAY_URL;
+const SECRET      = process.env.SSH_SECRET;
+const SHELL       = process.env.SHELL || "/bin/bash";
+const PTY_WRAPPER = path.join(__dirname, "pty_wrapper.py");
 
-// ── Logger co timestamp ──────────────────────────────────────────────────────
-function ts() {
-  return new Date().toISOString().replace("T", " ").slice(0, 23);
-}
+function ts() { return new Date().toISOString().replace("T"," ").slice(0,23); }
 const log  = (...a) => console.log (`[${ts()}] [server]`, ...a);
 const warn = (...a) => console.warn (`[${ts()}] [server] WARN`, ...a);
 const err  = (...a) => console.error(`[${ts()}] [server] ERR `, ...a);
 
-if (!RELAY_URL || !SECRET) {
-  err("Thieu RELAY_URL hoac SSH_SECRET");
-  process.exit(1);
-}
+if (!RELAY_URL || !SECRET) { err("Thieu RELAY_URL hoac SSH_SECRET"); process.exit(1); }
 
-// ── Thong tin runner ─────────────────────────────────────────────────────────
 log("============================================================");
-log("Github Actions SSH Server khoi dong");
-log(`  RELAY_URL : ${RELAY_URL}`);
-log(`  Runner    : ${process.env.RUNNER_NAME    || "unknown"}`);
-log(`  Repo      : ${process.env.GITHUB_REPOSITORY || "unknown"}`);
-log(`  Ref       : ${process.env.GITHUB_REF     || "unknown"}`);
-log(`  Run ID    : ${process.env.GITHUB_RUN_ID  || "unknown"}`);
-log(`  Workspace : ${process.env.GITHUB_WORKSPACE || process.cwd()}`);
-log(`  Shell     : ${SHELL}`);
-log(`  Node      : ${process.version}`);
-try {
-  const ip = execSync("curl -sf --max-time 5 https://ipinfo.io/ip").toString().trim();
-  log(`  Public IP : ${ip}`);
-} catch (_) {
-  warn("Khong lay duoc public IP");
-}
+log(`Relay  : ${RELAY_URL}`);
+log(`Shell  : ${SHELL}`);
+log(`Node   : ${process.version}`);
+try { log(`IP     : ${execSync("curl -sf --max-time 5 https://ipinfo.io/ip").toString().trim()}`); } catch(_){}
 log("============================================================");
-
-// ── Stats ────────────────────────────────────────────────────────────────────
-const stats = {
-  connectAttempts : 0,
-  msgSent         : 0,
-  msgRecv         : 0,
-  bytesSent       : 0,
-  bytesRecv       : 0,
-  shellStartTime  : null,
-};
 
 let retryCount = 0;
 
 function connect() {
-  stats.connectAttempts++;
-  log(`Ket noi toi relay... (lan ${stats.connectAttempts}, retry #${retryCount})`);
-  log(`  URL: ${RELAY_URL}`);
+  log(`Ket noi relay... (retry #${retryCount})`);
 
   const ws = new WebSocket(RELAY_URL, {
-    headers: {
-      "x-secret": SECRET,
-      "x-role"  : "server",
-    },
+    headers: { "x-secret": SECRET, "x-role": "server" },
     handshakeTimeout: 15000,
   });
 
-  // ── Timeout neu relay khong phan hoi ──────────────────────────────────────
   const connectTimeout = setTimeout(() => {
-    warn("WebSocket handshake timeout (15s) — huy va thu lai");
-    ws.terminate();
+    warn("Handshake timeout 15s"); ws.terminate();
   }, 16000);
+
+  // ── Port forward channel map ─────────────────────────────────────────────
+  // ch=0 → reserved cho shell (PTY)
+  // ch=1,2,... → TCP connections toi cac port tren runner
+  const pfChannels = new Map(); // ch -> net.Socket
+
+  function wsSend(obj) {
+    if (ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify(obj));
+  }
 
   ws.on("open", () => {
     clearTimeout(connectTimeout);
     retryCount = 0;
-    log("Ket noi relay THANH CONG");
-    log("Dang cho client SSH ket noi...");
+    log("Relay OK — spawn PTY");
 
-    // ── Spawn shell qua `script` de co pseudo-TTY ────────────────────────────
-    // Van de: khong co TTY that → bash buffer stdout noi bo → output khong
-    // bao gio flush ra pipe → client nhan duoc 0 bytes du shell dang chay.
-    // Fix: `script -q -c bash /dev/null` tao pseudo-TTY, bash nghi no dang
-    // chay trong terminal that nen flush ngay lap tuc sau moi lenh.
-    stats.shellStartTime = Date.now();
-
-    let cmd, args;
-    try {
-      execSync("which script", { stdio: "ignore" });
-      cmd  = "script";
-      args = ["-q", "-c", SHELL, "/dev/null"];
-      log(`Spawn via script (pseudo-TTY): script -q -c ${SHELL} /dev/null`);
-    } catch (_) {
-      try {
-        execSync("which stdbuf", { stdio: "ignore" });
-        cmd  = "stdbuf";
-        args = ["-oL", "-eL", SHELL];
-        log(`Spawn via stdbuf (line-buffer): stdbuf -oL -eL ${SHELL}`);
-      } catch (__) {
-        cmd  = SHELL;
-        args = [];
-        log(`WARN: khong co script/stdbuf, dung bash thuong — co the bi buffer stdout`);
-      }
-    }
-
-    const shell = spawn(cmd, args, {
-      env: {
-        ...process.env,
-        TERM      : "xterm-256color",
-        COLORTERM : "truecolor",
-        FORCE_COLOR: "1",
-      },
+    // ── PTY shell ─────────────────────────────────────────────────────────
+    const pty = spawn("python3", [PTY_WRAPPER], {
+      env: { ...process.env, SHELL, PTY_COLS:"220", PTY_ROWS:"50" },
       cwd: process.env.GITHUB_WORKSPACE || process.env.HOME || "/",
+      stdio: ["pipe","pipe","pipe"],
     });
+    log(`PTY PID=${pty.pid}`);
 
-    log(`Shell spawned cmd=${cmd} PID=${shell.pid}`);
-
-    // ── Heartbeat log moi 30 giac ────────────────────────────────────────────
-    const heartbeat = setInterval(() => {
-      const upSec = Math.floor((Date.now() - stats.shellStartTime) / 1000);
-      log(`HEARTBEAT up=${upSec}s ws=${ws.readyState} sent=${stats.msgSent}msgs/${(stats.bytesSent/1024).toFixed(1)}KB recv=${stats.msgRecv}msgs/${(stats.bytesRecv/1024).toFixed(1)}KB`);
-    }, 30000);
-
-    // ── shell stdout → WebSocket ─────────────────────────────────────────────
-    shell.stdout.on("data", (data) => {
-      if (ws.readyState !== WebSocket.OPEN) {
-        warn(`stdout DROP ${data.length}B — ws not OPEN (state=${ws.readyState})`);
-        return;
+    pty.stdout.on("data", (data) => {
+      wsSend({ type:"data", ch:0, payload: data.toString("base64") });
+    });
+    pty.stderr.on("data", (d) => log(`[pty] ${d.toString().trim()}`));
+    pty.on("error", (e) => err(`PTY error: ${e.message}`));
+    pty.on("close", (code) => {
+      log(`PTY closed code=${code}`);
+      // Dong het cac port forward
+      for (const [ch, sock] of pfChannels) {
+        sock.destroy();
+        pfChannels.delete(ch);
       }
-      const payload = data.toString("base64");
-      ws.send(JSON.stringify({ type: "data", payload }));
-      stats.msgSent++;
-      stats.bytesSent += data.length;
-      if (stats.msgSent <= 5) {
-        log(`stdout->ws msg#${stats.msgSent} ${data.length}B`);
-      }
-    });
-
-    // ── shell stderr → WebSocket ─────────────────────────────────────────────
-    shell.stderr.on("data", (data) => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      const payload = data.toString("base64");
-      ws.send(JSON.stringify({ type: "data", payload }));
-      stats.msgSent++;
-      stats.bytesSent += data.length;
-      warn(`stderr->ws ${data.length}B: ${data.toString().slice(0, 120)}`);
-    });
-
-    shell.on("error", (e) => {
-      err(`Shell spawn error: ${e.message}`);
-    });
-
-    shell.on("close", (code, signal) => {
-      clearInterval(heartbeat);
-      const dur = stats.shellStartTime
-        ? ((Date.now() - stats.shellStartTime) / 1000).toFixed(1)
-        : "?";
-      log("============================================================");
-      log(`Shell dong: code=${code} signal=${signal} duration=${dur}s`);
-      log(`  Tong sent: ${stats.msgSent} msgs, ${(stats.bytesSent/1024).toFixed(1)} KB`);
-      log(`  Tong recv: ${stats.msgRecv} msgs, ${(stats.bytesRecv/1024).toFixed(1)} KB`);
-      log("============================================================");
       if (ws.readyState === WebSocket.OPEN) ws.close(1000, "shell exited");
       process.exit(0);
     });
 
-    // ── WebSocket → shell stdin ──────────────────────────────────────────────
+    // ── WebSocket message handler ─────────────────────────────────────────
     ws.on("message", (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        stats.msgRecv++;
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch(e) { return; }
 
-        if (msg.type === "data") {
-          const buf = Buffer.from(msg.payload, "base64");
-          stats.bytesRecv += buf.length;
-          if (stats.msgRecv <= 5) {
-            log(`ws->stdin msg#${stats.msgRecv} ${buf.length}B`);
+      const ch = msg.ch ?? 0;
+
+      switch (msg.type) {
+
+        // ── Shell data / resize / ping ──────────────────────────────────
+        case "data":
+          if (ch === 0) {
+            // → PTY stdin
+            const buf = Buffer.from(msg.payload, "base64");
+            pty.stdin.write(JSON.stringify({ t:"d", p: buf.toString("base64") }) + "\n");
+          } else {
+            // → Port forward socket
+            const sock = pfChannels.get(ch);
+            if (sock && !sock.destroyed) {
+              sock.write(Buffer.from(msg.payload, "base64"));
+            } else {
+              warn(`pf data drop: ch=${ch} not found`);
+            }
           }
-          if (!shell.stdin.writable) {
-            warn("stdin khong con writable — bo qua");
-            return;
+          break;
+
+        case "resize":
+          pty.stdin.write(JSON.stringify({ t:"r", c: msg.cols, r: msg.rows }) + "\n");
+          break;
+
+        case "ping":
+          wsSend({ type:"pong" });
+          break;
+
+        // ── Port forward: mo ket noi TCP moi tren runner ────────────────
+        case "pf_open":
+          // Client yeu cau mo tunnel toi remotePort tren runner
+          const remotePort = msg.remotePort;
+          const newCh      = ch; // client da chon ch
+
+          log(`pf_open ch=${newCh} → localhost:${remotePort}`);
+
+          const socket = net.connect(remotePort, "127.0.0.1", () => {
+            log(`pf ch=${newCh} connected → :${remotePort}`);
+            wsSend({ type:"pf_connected", ch: newCh });
+          });
+
+          socket.on("data", (data) => {
+            wsSend({ type:"data", ch: newCh, payload: data.toString("base64") });
+          });
+
+          socket.on("close", () => {
+            log(`pf ch=${newCh} socket closed`);
+            pfChannels.delete(newCh);
+            wsSend({ type:"pf_closed", ch: newCh });
+          });
+
+          socket.on("error", (e) => {
+            err(`pf ch=${newCh} error: ${e.message}`);
+            pfChannels.delete(newCh);
+            wsSend({ type:"pf_error", ch: newCh, message: e.message });
+          });
+
+          pfChannels.set(newCh, socket);
+          break;
+
+        // ── Port forward: dong ket noi ───────────────────────────────────
+        case "pf_close":
+          const closeSock = pfChannels.get(ch);
+          if (closeSock) {
+            closeSock.destroy();
+            pfChannels.delete(ch);
+            log(`pf ch=${ch} closed by client`);
           }
-          shell.stdin.write(buf);
+          break;
 
-        } else if (msg.type === "resize") {
-          log(`Resize terminal: cols=${msg.cols} rows=${msg.rows} (ignored — no PTY)`);
-
-        } else if (msg.type === "ping") {
-          ws.send(JSON.stringify({ type: "pong" }));
-
-        } else {
-          warn(`Message type la: "${msg.type}"`);
-        }
-      } catch (e) {
-        err(`Parse message that bai: ${e.message} raw=${raw.toString().slice(0, 80)}`);
+        default:
+          warn(`Unknown msg type: ${msg.type}`);
       }
     });
 
     ws.on("close", (code, reason) => {
-      clearInterval(heartbeat);
-      log(`WebSocket dong: code=${code} reason=${reason?.toString() || "(none)"}`);
-      log("Kill shell...");
-      shell.kill("SIGTERM");
-      setTimeout(() => shell.kill("SIGKILL"), 3000);
+      log(`WS closed code=${code} reason=${reason?.toString()||"(none)"}`);
+      pty.kill("SIGTERM");
+      setTimeout(() => pty.kill("SIGKILL"), 3000);
+      for (const [, sock] of pfChannels) sock.destroy();
     });
   });
 
-  ws.on("error", (e) => {
+  ws.on("error", (e) => { clearTimeout(connectTimeout); err(e.message); scheduleRetry(); });
+  ws.on("close", (code) => {
     clearTimeout(connectTimeout);
-    err(`WebSocket error: ${e.message}`);
-    scheduleRetry();
+    if (code !== 1000) scheduleRetry();
   });
-
-  ws.on("close", (code, reason) => {
+  ws.on("unexpected-response", (_req, res) => {
     clearTimeout(connectTimeout);
-    if (code !== 1000) {
-      warn(`WebSocket dong ngoai y muon: code=${code} reason=${reason?.toString() || "(none)"}`);
-      scheduleRetry();
-    }
-  });
-
-  ws.on("unexpected-response", (req, res) => {
-    clearTimeout(connectTimeout);
-    err(`Relay phan hoi HTTP ${res.statusCode} — kiem tra RELAY_URL va SSH_SECRET`);
+    err(`HTTP ${res.statusCode} tu relay`);
     let body = "";
-    res.on("data", (d) => (body += d));
-    res.on("end", () => {
-      err(`Response body: ${body.slice(0, 200)}`);
-      scheduleRetry();
-    });
+    res.on("data", (d) => body += d);
+    res.on("end", () => { err(`Body: ${body.slice(0,200)}`); scheduleRetry(); });
   });
 }
 
 function scheduleRetry() {
   retryCount++;
-  const delay = Math.min(5000 * retryCount, 30000); // backoff toi da 30s
-  warn(`Thu lai lan ${retryCount} sau ${delay / 1000}s...`);
+  const delay = Math.min(5000 * retryCount, 30000);
+  warn(`Thu lai sau ${delay/1000}s...`);
   setTimeout(connect, delay);
 }
 
 connect();
-
-process.on("uncaughtException", (e) => {
-  err("uncaughtException:", e.message, e.stack);
-});
-
-process.on("unhandledRejection", (e) => {
-  err("unhandledRejection:", e);
-});
+process.on("uncaughtException", (e) => err("uncaught:", e.message));
+process.on("unhandledRejection", (e) => err("unhandled:", e));
