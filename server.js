@@ -1,115 +1,231 @@
 /**
- * server.js — Chạy trên Github Actions Runner
- *
- * Cách hoạt động:
- *  1. Kết nối WebSocket tới Relay Server (ví dụ: ngrok hoặc một VPS public)
- *  2. Spawn shell (`bash`) và pipe stdin/stdout qua WebSocket
- *  3. Client.js kết nối tới Relay để nhận shell session
- *
- * Cài đặt: npm install ws
+ * server.js - Chay tren Github Actions Runner
+ * npm install ws
  */
+
+"use strict";
 
 const { execSync, spawn } = require("child_process");
 const WebSocket = require("ws");
 
-// ─── Cấu hình ────────────────────────────────────────────────────────────────
-const RELAY_URL = process.env.RELAY_URL; // wss://your-relay-server/session
-const SECRET    = process.env.SSH_SECRET;  // Shared secret để xác thực
+const RELAY_URL = process.env.RELAY_URL;
+const SECRET    = process.env.SSH_SECRET;
 const SHELL     = process.env.SHELL || "/bin/bash";
-// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Logger co timestamp ──────────────────────────────────────────────────────
+function ts() {
+  return new Date().toISOString().replace("T", " ").slice(0, 23);
+}
+const log  = (...a) => console.log (`[${ts()}] [server]`, ...a);
+const warn = (...a) => console.warn (`[${ts()}] [server] WARN`, ...a);
+const err  = (...a) => console.error(`[${ts()}] [server] ERR `, ...a);
 
 if (!RELAY_URL || !SECRET) {
-  console.error("[server] ❌  Thiếu biến môi trường RELAY_URL hoặc SSH_SECRET");
+  err("Thieu RELAY_URL hoac SSH_SECRET");
   process.exit(1);
 }
 
-console.log("[server] 🚀  Github Actions runner đang kết nối tới relay...");
-console.log(`[server]     Runner: ${process.env.RUNNER_NAME || "unknown"}`);
-console.log(`[server]     Repo  : ${process.env.GITHUB_REPOSITORY || "unknown"}`);
-console.log(`[server]     Ref   : ${process.env.GITHUB_REF || "unknown"}`);
-
-// In ra một số thông tin debug hữu ích
+// ── Thong tin runner ─────────────────────────────────────────────────────────
+log("============================================================");
+log("Github Actions SSH Server khoi dong");
+log(`  RELAY_URL : ${RELAY_URL}`);
+log(`  Runner    : ${process.env.RUNNER_NAME    || "unknown"}`);
+log(`  Repo      : ${process.env.GITHUB_REPOSITORY || "unknown"}`);
+log(`  Ref       : ${process.env.GITHUB_REF     || "unknown"}`);
+log(`  Run ID    : ${process.env.GITHUB_RUN_ID  || "unknown"}`);
+log(`  Workspace : ${process.env.GITHUB_WORKSPACE || process.cwd()}`);
+log(`  Shell     : ${SHELL}`);
+log(`  Node      : ${process.version}`);
 try {
-  console.log(`[server]     IP    : ${execSync("curl -sf https://ipinfo.io/ip").toString().trim()}`);
-} catch (_) {}
+  const ip = execSync("curl -sf --max-time 5 https://ipinfo.io/ip").toString().trim();
+  log(`  Public IP : ${ip}`);
+} catch (_) {
+  warn("Khong lay duoc public IP");
+}
+log("============================================================");
+
+// ── Stats ────────────────────────────────────────────────────────────────────
+const stats = {
+  connectAttempts : 0,
+  msgSent         : 0,
+  msgRecv         : 0,
+  bytesSent       : 0,
+  bytesRecv       : 0,
+  shellStartTime  : null,
+};
+
+let retryCount = 0;
 
 function connect() {
+  stats.connectAttempts++;
+  log(`Ket noi toi relay... (lan ${stats.connectAttempts}, retry #${retryCount})`);
+  log(`  URL: ${RELAY_URL}`);
+
   const ws = new WebSocket(RELAY_URL, {
     headers: {
       "x-secret": SECRET,
       "x-role"  : "server",
     },
+    handshakeTimeout: 15000,
   });
 
-  ws.on("open", () => {
-    console.log("[server] ✅  Đã kết nối relay. Đang chờ client SSH...");
+  // ── Timeout neu relay khong phan hoi ──────────────────────────────────────
+  const connectTimeout = setTimeout(() => {
+    warn("WebSocket handshake timeout (15s) — huy va thu lai");
+    ws.terminate();
+  }, 16000);
 
-    // Spawn shell với PTY environment
+  ws.on("open", () => {
+    clearTimeout(connectTimeout);
+    retryCount = 0;
+    log("Ket noi relay THANH CONG");
+    log("Dang cho client SSH ket noi...");
+
+    // ── Spawn shell ──────────────────────────────────────────────────────────
+    stats.shellStartTime = Date.now();
+    log(`Spawn shell: ${SHELL}`);
+
     const shell = spawn(SHELL, [], {
-      env : {
+      env: {
         ...process.env,
-        TERM       : "xterm-256color",
-        COLORTERM  : "truecolor",
+        TERM      : "xterm-256color",
+        COLORTERM : "truecolor",
         FORCE_COLOR: "1",
       },
-      cwd  : process.env.GITHUB_WORKSPACE || process.env.HOME || "/",
+      cwd: process.env.GITHUB_WORKSPACE || process.env.HOME || "/",
     });
 
-    // shell stdout/stderr → WebSocket
+    log(`Shell spawned PID=${shell.pid}`);
+
+    // ── Heartbeat log moi 30 giac ────────────────────────────────────────────
+    const heartbeat = setInterval(() => {
+      const upSec = Math.floor((Date.now() - stats.shellStartTime) / 1000);
+      log(`HEARTBEAT up=${upSec}s ws=${ws.readyState} sent=${stats.msgSent}msgs/${(stats.bytesSent/1024).toFixed(1)}KB recv=${stats.msgRecv}msgs/${(stats.bytesRecv/1024).toFixed(1)}KB`);
+    }, 30000);
+
+    // ── shell stdout → WebSocket ─────────────────────────────────────────────
     shell.stdout.on("data", (data) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "data", payload: data.toString("base64") }));
+      if (ws.readyState !== WebSocket.OPEN) {
+        warn(`stdout DROP ${data.length}B — ws not OPEN (state=${ws.readyState})`);
+        return;
+      }
+      const payload = data.toString("base64");
+      ws.send(JSON.stringify({ type: "data", payload }));
+      stats.msgSent++;
+      stats.bytesSent += data.length;
+      if (stats.msgSent <= 5) {
+        log(`stdout->ws msg#${stats.msgSent} ${data.length}B`);
       }
     });
 
+    // ── shell stderr → WebSocket ─────────────────────────────────────────────
     shell.stderr.on("data", (data) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "data", payload: data.toString("base64") }));
-      }
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const payload = data.toString("base64");
+      ws.send(JSON.stringify({ type: "data", payload }));
+      stats.msgSent++;
+      stats.bytesSent += data.length;
+      warn(`stderr->ws ${data.length}B: ${data.toString().slice(0, 120)}`);
     });
 
-    shell.on("close", (code) => {
-      console.log(`[server] Shell đã thoát với code ${code}`);
-      ws.close();
+    shell.on("error", (e) => {
+      err(`Shell spawn error: ${e.message}`);
+    });
+
+    shell.on("close", (code, signal) => {
+      clearInterval(heartbeat);
+      const dur = stats.shellStartTime
+        ? ((Date.now() - stats.shellStartTime) / 1000).toFixed(1)
+        : "?";
+      log("============================================================");
+      log(`Shell dong: code=${code} signal=${signal} duration=${dur}s`);
+      log(`  Tong sent: ${stats.msgSent} msgs, ${(stats.bytesSent/1024).toFixed(1)} KB`);
+      log(`  Tong recv: ${stats.msgRecv} msgs, ${(stats.bytesRecv/1024).toFixed(1)} KB`);
+      log("============================================================");
+      if (ws.readyState === WebSocket.OPEN) ws.close(1000, "shell exited");
       process.exit(0);
     });
 
-    // WebSocket → shell stdin
+    // ── WebSocket → shell stdin ──────────────────────────────────────────────
     ws.on("message", (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
+        stats.msgRecv++;
 
         if (msg.type === "data") {
-          shell.stdin.write(Buffer.from(msg.payload, "base64"));
+          const buf = Buffer.from(msg.payload, "base64");
+          stats.bytesRecv += buf.length;
+          if (stats.msgRecv <= 5) {
+            log(`ws->stdin msg#${stats.msgRecv} ${buf.length}B`);
+          }
+          if (!shell.stdin.writable) {
+            warn("stdin khong con writable — bo qua");
+            return;
+          }
+          shell.stdin.write(buf);
+
         } else if (msg.type === "resize") {
-          // node-pty nếu muốn hỗ trợ resize thực sự
-          // shell.resize(msg.cols, msg.rows);
+          log(`Resize terminal: cols=${msg.cols} rows=${msg.rows} (ignored — no PTY)`);
+
         } else if (msg.type === "ping") {
           ws.send(JSON.stringify({ type: "pong" }));
+
+        } else {
+          warn(`Message type la: "${msg.type}"`);
         }
-      } catch (err) {
-        console.error("[server] Lỗi parse message:", err.message);
+      } catch (e) {
+        err(`Parse message that bai: ${e.message} raw=${raw.toString().slice(0, 80)}`);
       }
     });
 
-    ws.on("close", () => {
-      console.log("[server] Relay đóng kết nối — kill shell");
+    ws.on("close", (code, reason) => {
+      clearInterval(heartbeat);
+      log(`WebSocket dong: code=${code} reason=${reason?.toString() || "(none)"}`);
+      log("Kill shell...");
       shell.kill("SIGTERM");
+      setTimeout(() => shell.kill("SIGKILL"), 3000);
     });
   });
 
-  ws.on("error", (err) => {
-    console.error("[server] ❌  WebSocket error:", err.message);
-    console.log("[server] Thử lại sau 5 giây...");
-    setTimeout(connect, 5000);
+  ws.on("error", (e) => {
+    clearTimeout(connectTimeout);
+    err(`WebSocket error: ${e.message}`);
+    scheduleRetry();
   });
 
   ws.on("close", (code, reason) => {
+    clearTimeout(connectTimeout);
     if (code !== 1000) {
-      console.warn(`[server] Kết nối đóng (${code}): ${reason} — thử lại...`);
-      setTimeout(connect, 5000);
+      warn(`WebSocket dong ngoai y muon: code=${code} reason=${reason?.toString() || "(none)"}`);
+      scheduleRetry();
     }
+  });
+
+  ws.on("unexpected-response", (req, res) => {
+    clearTimeout(connectTimeout);
+    err(`Relay phan hoi HTTP ${res.statusCode} — kiem tra RELAY_URL va SSH_SECRET`);
+    let body = "";
+    res.on("data", (d) => (body += d));
+    res.on("end", () => {
+      err(`Response body: ${body.slice(0, 200)}`);
+      scheduleRetry();
+    });
   });
 }
 
+function scheduleRetry() {
+  retryCount++;
+  const delay = Math.min(5000 * retryCount, 30000); // backoff toi da 30s
+  warn(`Thu lai lan ${retryCount} sau ${delay / 1000}s...`);
+  setTimeout(connect, delay);
+}
+
 connect();
+
+process.on("uncaughtException", (e) => {
+  err("uncaughtException:", e.message, e.stack);
+});
+
+process.on("unhandledRejection", (e) => {
+  err("unhandledRejection:", e);
+});
