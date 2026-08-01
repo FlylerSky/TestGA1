@@ -81,11 +81,33 @@ function connect() {
     log("Ket noi relay THANH CONG");
     log("Dang cho client SSH ket noi...");
 
-    // ── Spawn shell ──────────────────────────────────────────────────────────
+    // ── Spawn shell qua `script` de co pseudo-TTY ────────────────────────────
+    // Van de: khong co TTY that → bash buffer stdout noi bo → output khong
+    // bao gio flush ra pipe → client nhan duoc 0 bytes du shell dang chay.
+    // Fix: `script -q -c bash /dev/null` tao pseudo-TTY, bash nghi no dang
+    // chay trong terminal that nen flush ngay lap tuc sau moi lenh.
     stats.shellStartTime = Date.now();
-    log(`Spawn shell: ${SHELL}`);
 
-    const shell = spawn(SHELL, [], {
+    let cmd, args;
+    try {
+      execSync("which script", { stdio: "ignore" });
+      cmd  = "script";
+      args = ["-q", "-c", SHELL, "/dev/null"];
+      log(`Spawn via script (pseudo-TTY): script -q -c ${SHELL} /dev/null`);
+    } catch (_) {
+      try {
+        execSync("which stdbuf", { stdio: "ignore" });
+        cmd  = "stdbuf";
+        args = ["-oL", "-eL", SHELL];
+        log(`Spawn via stdbuf (line-buffer): stdbuf -oL -eL ${SHELL}`);
+      } catch (__) {
+        cmd  = SHELL;
+        args = [];
+        log(`WARN: khong co script/stdbuf, dung bash thuong — co the bi buffer stdout`);
+      }
+    }
+
+    const shell = spawn(cmd, args, {
       env: {
         ...process.env,
         TERM      : "xterm-256color",
@@ -95,7 +117,7 @@ function connect() {
       cwd: process.env.GITHUB_WORKSPACE || process.env.HOME || "/",
     });
 
-    log(`Shell spawned PID=${shell.pid}`);
+    log(`Shell spawned cmd=${cmd} PID=${shell.pid}`);
 
     // ── Heartbeat log moi 30 giac ────────────────────────────────────────────
     const heartbeat = setInterval(() => {
