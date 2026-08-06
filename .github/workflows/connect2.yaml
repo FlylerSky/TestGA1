@@ -1,0 +1,47 @@
+name: SSH Debug via Cloudflare Quick Tunnel (Max Time)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ssh-debug:
+    runs-on: ubuntu-latest
+    # Đặt timeout-minutes tối đa của GitHub Actions (360 phút = 6 tiếng)
+    timeout-minutes: 360 
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 1. Cài đặt Cloudflared & OpenSSH Server
+      - name: Install Cloudflared & SSH
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      # 2. Cấu hình SSH Public Key cho runner
+      - name: Setup SSH Auth Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          chmod 700 ~/.ssh
+          sudo service ssh start
+
+      # 3. Khởi chạy Cloudflare Quick Tunnel & Lấy URL
+      - name: Start Cloudflare Quick Tunnel
+        run: |
+          cloudflared tunnel --url ssh://localhost:22 > cloudflared.log 2>&1 &
+          sleep 5
+          echo "========================================================="
+          echo "LINK SSH DÙNG ĐỂ KẾT NỐI (XEM DƯỚI ĐÂY):"
+          grep -o 'https://.*\.trycloudflare\.com' cloudflared.log || cat cloudflared.log
+          echo "========================================================="
+
+      # 4. Duy trì Job liên tục tối đa 6 tiếng (21600 giây)
+      - name: Keep Alive (Max 6 Hours)
+        run: |
+          echo "Job đang chạy và duy trì tunnel trong 6 tiếng..."
+          sleep 21600
